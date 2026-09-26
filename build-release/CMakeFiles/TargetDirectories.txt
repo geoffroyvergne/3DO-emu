@@ -1,0 +1,13 @@
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/emu_core.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/3do-emu.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/opera-ls.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/arm60_test.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/memory_test.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/opera_fs_test.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/cel_test.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/input_test.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/system_test.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/devices_test.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/test.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/edit_cache.dir
+/Users/gv/dev/projects/3DO-emu/build-release/CMakeFiles/rebuild_cache.dir

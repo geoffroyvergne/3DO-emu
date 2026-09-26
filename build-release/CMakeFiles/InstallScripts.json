@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/gv/dev/projects/3DO-emu/build-release/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
