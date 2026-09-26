@@ -167,7 +167,7 @@ void test_pc_operand_and_branch() {
 
     const u32 cycles = f.run(dp_imm(kAL, kMOV, false, 0, 15, 0, 0x80));  // MOV pc, #0x80
     CHECK_EQ(f.cpu.pc(), 0x80u);
-    CHECK_EQ(cycles, 3u);
+    CHECK_EQ(cycles, 4u);                                     // 1S + refill 1S+1N (N = 2)
 }
 
 void test_conditions() {

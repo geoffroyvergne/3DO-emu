@@ -24,6 +24,12 @@ struct Shifted {
     bool carry;
 };
 
+// Cycle costs, as Opera models the ARM60 on the 3DO bus: sequential and
+// internal cycles cost 1, non-sequential memory accesses cost 2.
+constexpr u32 kS = 1;
+constexpr u32 kN = 2;
+constexpr u32 kI = 1;
+
 constexpr bool bit(u32 value, u32 n) {
     return ((value >> n) & 1u) != 0;
 }
@@ -185,11 +191,11 @@ u32 Arm60::step() {
     // (handlers return with SUBS pc, lr, #4).
     if (fiq_line_ && !(regs_.cpsr & psr::kFiqDisable)) {
         enter_exception(Mode::Fiq, vector::kFiq, pc() + 4);
-        return 3;
+        return 2 * kS + kN;
     }
     if (irq_line_ && !(regs_.cpsr & psr::kIrqDisable)) {
         enter_exception(Mode::Irq, vector::kIrq, pc() + 4);
-        return 3;
+        return 2 * kS + kN;
     }
 
     if (watch_pc_ && !watch_hit_ && pc() == *watch_pc_) watch_hit_ = regs_;
@@ -408,12 +414,12 @@ u32 Arm60::op_data_processing(u32 instr) {
         default: logical(~op2.value); break;  // kMvn
     }
 
-    u32 cycles = register_shift ? 2 : 1;  // 1S (+1I for register shift)
+    u32 cycles = kS + (register_shift ? kI : 0);  // 1S (+1I for register shift)
     if (!writes_rd) return cycles;
     if (rd == 15) {
         if (set_flags) restore_cpsr_from_spsr();
         write_pc(result);
-        cycles += 2;  // pipeline refill: +1N +1S
+        cycles += kS + kN;  // pipeline refill: +1N +1S
     } else {
         regs_.r[rd] = result;
     }
@@ -439,7 +445,7 @@ u32 Arm60::op_multiply(u32 instr) {
     // Booth multiplier retires 2 bits of Rs per internal cycle (approximation).
     const u32 significant_bits = 32 - static_cast<u32>(std::countl_zero(rs_value));
     const u32 booth_cycles = std::max(1u, (significant_bits + 1) / 2);
-    return 1 + booth_cycles + (accumulate ? 1 : 0);
+    return kS + booth_cycles * kI + (accumulate ? kI : 0);
 }
 
 u32 Arm60::op_swap(u32 instr) {
@@ -461,7 +467,7 @@ u32 Arm60::op_swap(u32 instr) {
         write_pc(loaded);
     else
         regs_.r[rd] = loaded;
-    return 4;
+    return kS + 2 * kN + kI;
 }
 
 u32 Arm60::op_mrs(u32 instr) {
@@ -531,7 +537,7 @@ u32 Arm60::op_single_transfer(u32 instr) {
             write_pc(value);
         else
             regs_.r[rd] = value;
-        return rd == 15 ? 5 : 3;  // 1S+1N+1I (+1S+1N for PC)
+        return kS + kN + kI + (rd == 15 ? kS + kN : 0);  // 1S+1N+1I (+1S+1N for PC)
     }
 
     u32 value = user_access ? user_reg(rd) : regs_.r[rd];
@@ -542,7 +548,7 @@ u32 Arm60::op_single_transfer(u32 instr) {
         bus_.write32(address & ~3u, value);
     if (bus_.consume_abort()) return take_data_abort();
     if (do_writeback && rn != 15) regs_.r[rn] = offset_base;
-    return 2;  // 2N
+    return 2 * kN;
 }
 
 u32 Arm60::op_block_transfer(u32 instr) {
@@ -594,7 +600,7 @@ u32 Arm60::op_block_transfer(u32 instr) {
                 regs_.r[i] = value;
             }
         }
-        return count + 2 + (loads_pc ? 2 : 0);  // nS+1N+1I (+1S+1N for PC)
+        return count * kS + kN + kI + (loads_pc ? kS + kN : 0);  // nS+1N+1I (+1S+1N for PC)
     }
 
     const u32 lowest = static_cast<u32>(std::countr_zero(list));
@@ -612,7 +618,7 @@ u32 Arm60::op_block_transfer(u32 instr) {
     }
     if (aborted) return take_data_abort();
     if (writeback && rn != 15) regs_.r[rn] = new_base;
-    return count + 1;  // (n-1)S+2N
+    return (count - 1) * kS + 2 * kN;  // (n-1)S+2N
 }
 
 // --- Branches and exceptions -------------------------------------------------
@@ -621,18 +627,18 @@ u32 Arm60::op_branch(u32 instr) {
     const auto offset = static_cast<u32>(static_cast<s32>(instr << 8) >> 6);  // sign-extend, *4
     if (bit(instr, 24)) regs_.r[14] = pc() + 4;  // BL: return to the next instruction
     write_pc(regs_.r[15] + offset);
-    return 3;  // 2S+1N
+    return 2 * kS + kN;
 }
 
 u32 Arm60::take_data_abort() {
     // Return address is the aborted instruction + 8 (handlers use SUBS pc, lr, #8).
     enter_exception(Mode::Abort, vector::kDataAbort, pc() + 8);
-    return 3;
+    return 2 * kS + kN;
 }
 
 u32 Arm60::op_swi(u32 /*instr*/) {
     enter_exception(Mode::Supervisor, vector::kSwi, pc() + 4);
-    return 3;
+    return 2 * kS + kN;
 }
 
 u32 Arm60::op_undefined(u32 instr) {
@@ -643,7 +649,7 @@ u32 Arm60::op_undefined(u32 instr) {
                   instr, pc());
     }
     enter_exception(Mode::Undefined, vector::kUndefined, pc() + 4);
-    return 3;
+    return 2 * kS + kN;
 }
 
 }  // namespace core::cpu

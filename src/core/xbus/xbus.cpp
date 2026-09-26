@@ -14,7 +14,7 @@ Xbus::Xbus(std::function<void()> raise_interrupt) : raise_interrupt_(std::move(r
 }
 
 void Xbus::reset() {
-    cd_drive_.reset();
+    cd_drive_.reset();  // keeps any inserted disc
     select_low_ = select_high_ = 0;
     poll_ = poll::kIntEnMask;
     bus_poll_flags_ = 0;
@@ -41,8 +41,13 @@ void Xbus::check_interrupt() {
     if (pending && raise_interrupt_) raise_interrupt_();
 }
 
-void Xbus::tick() {
+void Xbus::tick(u32 cpu_cycles) {
+    cd_drive_.advance(cpu_cycles);
     check_interrupt();
+}
+
+u8 Xbus::read_data() {
+    return device_present(select_low_) ? cd_drive_.read_data() : 0;
 }
 
 u32 Xbus::read(u32 offset) {
@@ -69,7 +74,7 @@ u32 Xbus::read(u32 offset) {
         return 0;
     }
 
-    return 0;  // data FIFO: no data without a disc
+    return read_data();  // data FIFO
 }
 
 void Xbus::write(u32 offset, u32 value) {

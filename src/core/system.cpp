@@ -1,6 +1,10 @@
 #include "core/system.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <format>
+#include <string>
+#include <string_view>
 #include <cmath>
 
 #include "common/log.hpp"
@@ -13,6 +17,9 @@
 #include "core/xbus/xbus.hpp"
 #include "core/slowbus/slow_bus.hpp"
 #include "core/video/vdlp.hpp"
+#include "core/cdrom/disc_image.hpp"
+#include "core/dsp/audio_dma.hpp"
+#include "core/dsp/dspp.hpp"
 
 namespace core {
 
@@ -27,12 +34,33 @@ System::System()
           [clio = clio_.get()] { clio->raise_int0(clio::Clio::kInt0ExpansionBus); })),
       slow_bus_(std::make_unique<slowbus::SlowBus>()),
       vdlp_(std::make_unique<video::Vdlp>(memory_->vram())),
+      audio_dma_(std::make_unique<dsp::AudioDma>(
+          memory_->ram(), [clio = clio_.get()](u32 bits) { clio->raise_int0(bits); })),
+      dspp_(std::make_unique<dsp::Dspp>(*audio_dma_)),
       cel_target_(static_cast<std::size_t>(kDemoWidth * kDemoHeight)),
       framebuffer_(384 * 288, 0xFF000000) {
     memory_->attach(MmioRegion::Madam, madam_.get());
     memory_->attach(MmioRegion::Clio, clio_.get());
     memory_->attach(MmioRegion::Sport, sport_.get());
     clio_->attach_xbus(xbus_.get());
+    clio_->attach_dsp(dspp_.get(), audio_dma_.get());
+    madam_->attach_audio_dma(audio_dma_.get());
+    // Expansion-bus DMA (CD data into RAM), as Opera's clio_handle_dma: copy
+    // len + 4 bytes from the XBUS data FIFO to MADAM's DMA target.
+    clio_->set_xbus_dma_handler([this] {
+        u32 dest = madam_->mmio_read32(madam::Madam::kRegXbusDmaDest);
+        auto len = static_cast<s32>(madam_->mmio_read32(madam::Madam::kRegXbusDmaLen));
+        if (std::getenv("EMU_TRACE_CD"))
+            Log::info("XBUS DMA -> 0x{:06X}, {} bytes, drive has {} bytes ready", dest, len + 4,
+                      xbus_->cd_drive().data_available());
+        const u32 start = dest;
+        for (; len >= 0; len -= 4)
+            for (int i = 0; i < 4; ++i) memory_->write8(dest++, xbus_->read_data());
+        if (std::getenv("EMU_TRACE_CD"))
+            Log::info("XBUS DMA wrote {:08X} {:08X} at 0x{:06X}", memory_->read32(start),
+                      memory_->read32(start + 4), start);
+        madam_->mmio_write32(madam::Madam::kRegXbusDmaLen, 0xFFFFFFFC);
+    });
     memory_->attach(MmioRegion::NvramDiag, slow_bus_.get());
     memory_->set_pc_probe([cpu = cpu_.get()] { return cpu->pc(); });
     // Player-bus DMA completion: CLIO Int1 bit 0 (INT1_PLYINT), as in Opera.
@@ -49,6 +77,7 @@ u32 System::cpu_pc() const {
 
 void System::set_region(Region region) {
     region_ = region;
+    region_forced_ = true;
     Log::info("Region: {} ({} lines, {:.2f} Hz)", region == Region::Pal ? "PAL" : "NTSC",
               scanlines_per_field(), field_rate_hz());
 }
@@ -56,6 +85,10 @@ void System::set_region(Region region) {
 double System::field_rate_hz() const {
     // Opera: OPERA_NTSC_FIELD_RATE_1616 = 3928227 / 65536, PAL = 50.
     return region_ == Region::Pal ? 50.0 : 3928227.0 / 65536.0;
+}
+
+std::vector<s16> System::take_audio() {
+    return std::exchange(audio_out_, {});
 }
 
 int System::screen_width() const {
@@ -86,6 +119,10 @@ void System::reset() {
     xbus_->reset();
     odd_field_ = false;
     vdlp_->reset();
+    audio_dma_->reset();
+    dspp_->init();
+    audio_phase_ = 0;
+    audio_out_.clear();
     std::ranges::fill(framebuffer_, 0xFF000000);
     frame_count_ = 0;
     total_cycles_ = 0;
@@ -94,8 +131,45 @@ void System::reset() {
     Log::info("System reset ({} cycles/field)", cycles_per_field());
 }
 
+bool System::insert_disc(const std::filesystem::path& path) {
+    auto disc = cdrom::DiscImage::open(path);
+    if (!disc) return false;
+    Log::info("Disc: '{}' ({}, {} sectors)", path.string(), cdrom::DiscImage::format_name(disc->format()),
+              disc->sector_count());
+    xbus_->cd_drive().insert_disc(std::move(disc));
+    disc_name_ = path.stem().string();
+    return true;
+}
+
+bool System::change_disc(const std::filesystem::path& path) {
+    auto disc = cdrom::DiscImage::open(path);
+    if (!disc) return false;
+    Log::info("Disc change: tray opens, '{}' goes in", path.stem().string());
+    xbus_->cd_drive().open_tray();
+    pending_disc_ = std::move(disc);
+    tray_close_frame_ = frame_count_ + static_cast<u64>(field_rate_hz());  // about one second
+    disc_name_ = path.stem().string();
+    return true;
+}
+
+namespace {
+
+// PAL BIOS images carry the diagnostics string for the PAL video system;
+// NTSC ones do not (checked on Panasonic FZ-1 PAL and NTSC dumps).
+bool is_pal_bios(std::span<const u8> image) {
+    constexpr std::string_view kMarker = "VIDEO SYSTEM   :PAL";
+    const auto* begin = reinterpret_cast<const char*>(image.data());
+    return std::string_view(begin, image.size()).find(kMarker) != std::string_view::npos;
+}
+
+}  // namespace
+
 bool System::load_bios(std::span<const u8> image) {
     if (!memory_->load_rom(image)) return false;
+    if (!region_forced_) {
+        region_ = is_pal_bios(image) ? Region::Pal : Region::Ntsc;
+        Log::info("Region: {} (detected from the BIOS)", region_ == Region::Pal ? "PAL" : "NTSC");
+    }
     bios_loaded_ = true;
     reset();
     return true;
@@ -132,7 +206,22 @@ void System::run_frame() {
             cycle_overshoot_ = cycle_overshoot_ + executed - line_cycles;
             total_cycles_ += executed;
             clio_->advance_timers(executed);
-            xbus_->tick();
+
+            // Audio: one DSP pass per 44.1 kHz sample.
+            audio_phase_ += u64{executed} * dsp::Dspp::kSampleRate;
+            while (audio_phase_ >= kCpuClockHz) {
+                audio_phase_ -= kCpuClockHz;
+                const u32 sample = dspp_->run_sample();
+                if (dspp_->take_interrupt()) {
+                    clio_->raise_int0(clio::Clio::kInt0Dsp);
+                    ++dsp_interrupts_;
+                }
+                if (audio_out_.size() < 2 * dsp::Dspp::kSampleRate) {  // keep at most 1 s
+                    audio_out_.push_back(static_cast<s16>(sample & 0xFFFF));  // left
+                    audio_out_.push_back(static_cast<s16>(sample >> 16));     // right
+                }
+            }
+            xbus_->tick(executed);
         }
         odd_field_ = !odd_field_;
         // TODO: catch up MADAM/timers/DSP to the CPU once they exist.
@@ -158,6 +247,20 @@ void System::run_frame() {
     demo_y_ += (pad.pressed(input::PadButton::Down) ? 2.0 : 0.0) -
                (pad.pressed(input::PadButton::Up) ? 2.0 : 0.0);
 
+    if (std::getenv("EMU_TRACE_DSP") && frame_count_ % 50 == 49) {
+        const auto counters = dspp_->take_fifo_counters();
+        std::string fifo;
+        for (u32 ch = 0; ch < 13; ++ch)
+            if (counters.data[ch] || counters.status[ch])
+                fifo += std::format(" ch{}: {} data / {} status", ch, counters.data[ch], counters.status[ch]);
+        Log::info("DSP: {} interrupts in the last 50 frames, running={}{}", dsp_interrupts_,
+                  dspp_->running(), fifo);
+        dsp_interrupts_ = 0;
+    }
+    if (pending_disc_ && frame_count_ >= tray_close_frame_) {
+        Log::info("Disc change: tray closes");
+        xbus_->cd_drive().close_tray(std::move(pending_disc_));
+    }
     if (!bios_loaded_) render_test_pattern();
     ++frame_count_;
 }

@@ -183,6 +183,38 @@ private:
     u32 rows_ = 0;
 };
 
+// LRFORM rows: the source is itself a frame buffer, stored in line pairs
+// (row i, column j at (i/2) * stride + (i&1) * 2 + j * 4), so a rendered
+// screen can be drawn as a cel. 16 bpp only (Opera's DrawLRCel).
+class LrFormRows {
+public:
+    LrFormRows(const Ccb& ccb, u32 bpp_code) : ccb_(ccb), bpp_code_(bpp_code) {
+        const u32 word_offset = (ccb.pre1 & pre1::kWOffset10Mask) >> pre1::kWOffset10Shift;
+        stride_ = (std::size_t{word_offset} + 2) * 4;
+        width_ = (ccb.pre1 & pre1::kTlHpCountMask) + 1;
+        rows_ = (((ccb.pre0 & pre0::kVCountMask) >> pre0::kVCountShift) + 1) * 2;
+    }
+
+    [[nodiscard]] u32 rows() const { return rows_; }
+
+    void decode_row(u32 row, std::vector<Texel>& out) {
+        out.clear();
+        const std::size_t base = (row >> 1) * stride_ + (row & 1) * 2;
+        for (u32 x = 0; x < width_; ++x) {
+            const std::size_t a = base + std::size_t{x} * 4;
+            const u32 raw = a + 1 < ccb_.source.size() ? (u32{ccb_.source[a]} << 8) | ccb_.source[a + 1] : 0;
+            out.push_back(decode_pixel(ccb_, bpp_code_, raw));
+        }
+    }
+
+private:
+    const Ccb& ccb_;
+    u32 bpp_code_;
+    std::size_t stride_ = 0;
+    u32 width_ = 0;
+    u32 rows_ = 0;
+};
+
 // Packed rows: each starts with a word offset to the next row, then packets
 // of a 2-bit type and a 6-bit count-1: 0 end of row, 1 literal pixels,
 // 2 transparent run, 3 one pixel repeated (Opera's DrawPackedCel).
@@ -285,15 +317,19 @@ private:
 };
 
 // --- Rasteriser --------------------------------------------------------------------
-// Coordinates are 16.16. Pixels are sampled at integer positions (as Opera
-// does), and each texel quad is split into two triangles filled with a
-// top-left rule, so adjacent texels neither overlap nor leave gaps.
+// Coordinates are 16.16. Each texel quad is split into two triangles filled
+// with a top-left rule, so adjacent texels neither overlap nor leave gaps.
+// Pixel (x, y) is sampled just inside its bottom-right corner, which
+// reproduces Opera's coverage (it floors texel corners to whole pixels): a
+// cel at X = 10.5 puts its first column on pixel 10, and whole-pixel
+// positions behave as with integer sampling.
 
 struct Point {
     s64 x;
     s64 y;
 };
 
+constexpr s64 kSampleOffset = 0xFFFF;  // 1 - 1/65536 pixel
 constexpr s64 floor_to_int(s64 v) { return v >> 16; }
 constexpr s64 ceil_to_int(s64 v) { return (v + 0xFFFF) >> 16; }
 
@@ -311,10 +347,10 @@ void fill_triangle(Point a, Point b, Point c, int width, int height, Plot&& plot
     if (edge(a, b, c) < 0) std::swap(b, c);
     if (edge(a, b, c) == 0) return;
 
-    const s64 min_x = std::max<s64>(ceil_to_int(std::min({a.x, b.x, c.x})), 0);
-    const s64 max_x = std::min<s64>(floor_to_int(std::max({a.x, b.x, c.x})), width - 1);
-    const s64 min_y = std::max<s64>(ceil_to_int(std::min({a.y, b.y, c.y})), 0);
-    const s64 max_y = std::min<s64>(floor_to_int(std::max({a.y, b.y, c.y})), height - 1);
+    const s64 min_x = std::max<s64>(ceil_to_int(std::min({a.x, b.x, c.x}) - kSampleOffset), 0);
+    const s64 max_x = std::min<s64>(floor_to_int(std::max({a.x, b.x, c.x}) - kSampleOffset), width - 1);
+    const s64 min_y = std::max<s64>(ceil_to_int(std::min({a.y, b.y, c.y}) - kSampleOffset), 0);
+    const s64 max_y = std::min<s64>(floor_to_int(std::max({a.y, b.y, c.y}) - kSampleOffset), height - 1);
 
     const bool tl_ab = is_top_left(a, b);
     const bool tl_bc = is_top_left(b, c);
@@ -322,7 +358,7 @@ void fill_triangle(Point a, Point b, Point c, int width, int height, Plot&& plot
 
     for (s64 y = min_y; y <= max_y; ++y) {
         for (s64 x = min_x; x <= max_x; ++x) {
-            const Point p{x << 16, y << 16};
+            const Point p{(x << 16) + kSampleOffset, (y << 16) + kSampleOffset};
             const s64 e0 = edge(a, b, p);
             const s64 e1 = edge(b, c, p);
             const s64 e2 = edge(c, a, p);
@@ -398,7 +434,8 @@ CelStats draw(const Ccb& ccb, Surface& surface) {
 
     const u32 bpp_code = ccb.pre0 & pre0::kBppMask;
     const bool packed = (ccb.flags & ccb_flag::kPacked) != 0;
-    if (!format_supported(bpp_code) || (!packed && (ccb.pre1 & pre1::kLrForm))) {
+    const bool lr_form = !packed && (ccb.pre1 & pre1::kLrForm);
+    if (!format_supported(bpp_code) || (lr_form && bpp_code != pre0::kBpp16)) {
         format_log.warn("Cel engine: unimplemented source format (flags 0x{:08X}, PRE0 0x{:08X}, "
                         "PRE1 0x{:08X})",
                         ccb.flags, ccb.pre0, ccb.pre1);
@@ -410,8 +447,13 @@ CelStats draw(const Ccb& ccb, Surface& surface) {
         const u32 lsb = (ccb.cecontrol & cecontrol::kPdcLsbMask) >> cecontrol::kPdcLsbShift;
         return rasterise(ccb, rows, surface, lsb);
     }
+    const u32 blue_lsb = (ccb.pre1 & pre1::kTlLsbMask) >> pre1::kTlLsbShift;
+    if (lr_form) {
+        LrFormRows rows(ccb, bpp_code);
+        return rasterise(ccb, rows, surface, blue_lsb);
+    }
     LiteralRows rows(ccb, bpp_code);
-    return rasterise(ccb, rows, surface, (ccb.pre1 & pre1::kTlLsbMask) >> pre1::kTlLsbShift);
+    return rasterise(ccb, rows, surface, blue_lsb);
 }
 
 }  // namespace

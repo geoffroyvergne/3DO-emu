@@ -1,11 +1,13 @@
 #include "core/madam/madam.hpp"
 
+#include <cstdlib>
 #include <vector>
 
 #include "common/log.hpp"
 #include "core/bus/bus.hpp"
 #include "core/input/pbus.hpp"
 #include "core/madam/cel.hpp"
+#include "core/dsp/audio_dma.hpp"
 
 namespace core::madam {
 
@@ -47,6 +49,8 @@ u32 Madam::mmio_read32(u32 offset) {
         warn_unmodelled("read", offset);
         return 0;
     }
+    if (fifos_ && offset >= dsp::AudioDma::kFirstRegister && offset <= dsp::AudioDma::kLastRegister)
+        return fifos_->read_register(offset);
     switch (offset) {
         case kRegRevision: return kRevisionGreen;
         case kRegStatBits: return 0;  // the list runs to completion on SPRSTRT
@@ -64,6 +68,8 @@ u32 Madam::mmio_read32(u32 offset) {
         case kRegNextCcb:
         case kRegPlutData:
         case kRegPData:
+        case kRegXbusDmaDest:
+        case kRegXbusDmaLen:
         case kRegMSysBits:
         case kRegMctl:
         case kRegPlayerDest:
@@ -77,6 +83,10 @@ u32 Madam::mmio_read32(u32 offset) {
 void Madam::mmio_write32(u32 offset, u32 value) {
     if (offset >= kRegisterBytes) {
         warn_unmodelled("write", offset);
+        return;
+    }
+    if (fifos_ && offset >= dsp::AudioDma::kFirstRegister && offset <= dsp::AudioDma::kLastRegister) {
+        fifos_->write_register(offset, value);
         return;
     }
     switch (offset) {
@@ -121,6 +131,8 @@ void Madam::mmio_write32(u32 offset, u32 value) {
         case kRegNextCcb:
         case kRegPlutData:
         case kRegPData:
+        case kRegXbusDmaDest:
+        case kRegXbusDmaLen:
         case kRegPlayerDest:
         case kRegPlayerLen:
         case kRegPlayerOut: break;
@@ -286,6 +298,13 @@ void Madam::run_cel_list() {
         ccb.cecontrol = reg(kRegCeControl);
 
         const CelStats stats = draw_cel(ccb, target);
+        static const bool trace = std::getenv("EMU_TRACE_CEL") != nullptr;
+        if (trace)
+            Log::info("CEL flags {:08X} pre0 {:08X} pre1 {:08X} pos ({:.2f},{:.2f}) hd ({:.3f},{:.3f}) "
+                      "vd ({:.3f},{:.3f}) pixc {:08X} src {:06X} -> {} texels, {} px, target {:06X} clip {}x{}",
+                      flags, pre0_word, pre1_word, x_pos_ / 65536.0, y_pos_ / 65536.0, hdx_ / 1048576.0,
+                      hdy_ / 1048576.0, vdx_ / 65536.0, vdy_ / 65536.0, pixc_, pdata, stats.texels_drawn,
+                      stats.pixels_written, target.write_base, target.clip_x + 1, target.clip_y + 1);
         ++cels_drawn_;
         // The engine leaves its position just below the cel it drew.
         x_pos_ = static_cast<s32>(static_cast<u32>(x_pos_) + static_cast<u32>(vdx_) * stats.rows);

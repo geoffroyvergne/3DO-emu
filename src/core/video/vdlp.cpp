@@ -115,6 +115,10 @@ void Vdlp::render_line(bool video_dma, std::span<u32> out) const {
     }
     const u32 width = std::min<u32>(modulo_pixels(), static_cast<u32>(out.size()));
     const bool bypass = clut_bypass(display_);
+    // Lines narrower than the output (320 in a 384-wide PAL frame) are centred.
+    const u32 margin = (static_cast<u32>(out.size()) - width) / 2;
+    std::ranges::fill(out, 0xFF000000);
+    out = out.subspan(margin, width);
     for (u32 x = 0; x < width; ++x) {
         const u16 p = read16(current_fba_ + 4 * x);
         u32 argb;
@@ -129,7 +133,6 @@ void Vdlp::render_line(bool video_dma, std::span<u32> out) const {
         }
         out[x] = argb;
     }
-    std::fill(out.begin() + width, out.end(), 0xFF000000);
 }
 
 void Vdlp::process_line(u32 line, u32 head, bool clut_dma, bool video_dma, std::span<u32> out) {

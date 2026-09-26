@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <filesystem>
+#include <string>
 #include <memory>
 #include <span>
 #include <vector>
@@ -32,6 +34,13 @@ class SlowBus;
 namespace video {
 class Vdlp;
 }
+namespace cdrom {
+class DiscImage;
+}
+namespace dsp {
+class AudioDma;
+class Dspp;
+}
 
 // Video standard: sets the field rate and scanline count (values from Opera).
 enum class Region { Ntsc, Pal };
@@ -42,6 +51,8 @@ class System {
 public:
     static constexpr u32 kCpuClockHz = 12'500'000;  // ARM60 @ 12.5 MHz
 
+    // Forces the video standard. Without a call, load_bios() picks it from
+    // the BIOS image (a PAL BIOS means a PAL console).
     void set_region(Region region);
     [[nodiscard]] Region region() const { return region_; }
     [[nodiscard]] double field_rate_hz() const;  // 59.94 (NTSC) or 50 (PAL)
@@ -57,8 +68,23 @@ public:
 
     void reset();
 
+    [[nodiscard]] bool bios_loaded() const { return bios_loaded_; }
+
     // Loads a BIOS image and resets the machine. Returns false if rejected.
     bool load_bios(std::span<const u8> image);
+
+    // Puts a disc image (.iso, .bin, .chd) in the CD drive. Returns false if it
+    // cannot be opened. Takes effect for the next boot/reset.
+    bool insert_disc(const std::filesystem::path& path);
+
+    // Swaps discs on a running console, like opening the tray and closing it
+    // on another disc about a second later. The OS then checks the new disc
+    // (a multi-disc game picks it up; a different game reboots the console).
+    // Returns false (keeping the current disc) if the image cannot be opened.
+    bool change_disc(const std::filesystem::path& path);
+
+    // Name of the disc in the drive (empty if none).
+    [[nodiscard]] const std::string& disc_name() const { return disc_name_; }
 
     // Runs exactly one video frame worth of emulated cycles.
     void run_frame();
@@ -72,6 +98,9 @@ public:
     }
 
     [[nodiscard]] u64 frame_count() const { return frame_count_; }
+
+    // Audio produced since the last call: interleaved stereo s16 at 44.1 kHz.
+    [[nodiscard]] std::vector<s16> take_audio();
     [[nodiscard]] bool cpu_halted() const { return cpu_halted_; }
     [[nodiscard]] u32 cpu_pc() const;  // diagnostics
 
@@ -102,7 +131,16 @@ private:
     std::unique_ptr<xbus::Xbus> xbus_;
     std::unique_ptr<slowbus::SlowBus> slow_bus_;
     std::unique_ptr<video::Vdlp> vdlp_;
+    std::unique_ptr<dsp::AudioDma> audio_dma_;
+    std::unique_ptr<dsp::Dspp> dspp_;
+    u64 audio_phase_ = 0;          // CPU cycles * 44100, modulo the CPU clock
+    std::vector<s16> audio_out_;
+    u64 dsp_interrupts_ = 0;  // diagnostics
+    std::unique_ptr<cdrom::DiscImage> pending_disc_;  // waiting for the tray to close
+    u64 tray_close_frame_ = 0;
+    std::string disc_name_;
     Region region_ = Region::Ntsc;
+    bool region_forced_ = false;
     bool odd_field_ = false;
     bool bios_loaded_ = false;
     bool cpu_halted_ = false;  // set when the PC leaves executable memory

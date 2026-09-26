@@ -130,10 +130,27 @@ void test_warp_widens_rows() {
         for (int x = 0; x < kW; ++x) n += canvas.at(x, y) != kBackground;
         return n;
     };
-    CHECK_EQ(row_width(2), 4);   // row 0 sampled at its top edge: H = 1
-    CHECK_EQ(row_width(3), 8);   // row 1: H = 2
-    CHECK_EQ(row_width(5), 16);  // row 3: H = 4
+    // Pixels sample near their bottom edge, where each row is almost as wide
+    // as the next row's H: 4 texels x (H just under 2, 3, 5).
+    CHECK_EQ(row_width(2), 7);
+    CHECK_EQ(row_width(3), 11);
+    CHECK_EQ(row_width(5), 19);
     CHECK_EQ(row_width(6), 0);
+}
+
+void test_half_pixel_position() {
+    // A cel at X = 10.5 starts on pixel 10, as in Opera (corners are floored).
+    const Cel16 cel(2, 1, {rgb(1, 2, 3), rgb(4, 5, 6)});
+    Ccb ccb = cel.ccb(0, 5);
+    ccb.x_pos = (10 << 16) | 0x8000;
+    ccb.y_pos = (5 << 16) | 0x8000;
+    Canvas canvas;
+    draw_cel(ccb, canvas.fb());
+    CHECK_EQ(canvas.at(10, 5), rgb(1, 2, 3));
+    CHECK_EQ(canvas.at(11, 5), rgb(4, 5, 6));
+    CHECK_EQ(canvas.at(12, 5), kBackground);
+    CHECK_EQ(canvas.at(10, 6), kBackground);
+    CHECK_EQ(canvas.count_changed(), 2);
 }
 
 void test_face_culling() {
@@ -209,6 +226,31 @@ void test_vram_line_pair_layout() {
     CHECK_EQ((ram[even + 2] << 8) | ram[even + 3], rgb(0, 31, 0));
 }
 
+void test_lrform_cel() {
+    // A 2x2 LRFORM source: one line pair, both pixels of a column in one word.
+    std::vector<u8> ram(0x100);
+    const u16 px[2][2] = {{rgb(31, 0, 0), rgb(0, 31, 0)}, {rgb(0, 0, 31), rgb(5, 5, 5)}};  // [row][col]
+    for (int x = 0; x < 2; ++x)
+        for (int y = 0; y < 2; ++y) {
+            const std::size_t a = static_cast<std::size_t>(x * 4 + y * 2);
+            ram[a] = static_cast<u8>(px[y][x] >> 8);
+            ram[a + 1] = static_cast<u8>(px[y][x]);
+        }
+    Ccb ccb;
+    ccb.pre0 = pre0::kBpp16 | pre0::kLinear;  // VCNT 0: one line pair = 2 rows
+    ccb.pre1 = pre1::kLrForm | (0u << pre1::kWOffset10Shift) | (1u << pre1::kTlLsbShift) | 1u;  // 2 wide
+    ccb.source = ram;
+    ccb.x_pos = 3 << 16;
+    ccb.y_pos = 4 << 16;
+    Canvas canvas;
+    const CelStats stats = draw_cel(ccb, canvas.fb());
+    CHECK_EQ(stats.rows, 2u);
+    CHECK_EQ(canvas.at(3, 4), rgb(31, 0, 0));
+    CHECK_EQ(canvas.at(4, 4), rgb(0, 31, 0));
+    CHECK_EQ(canvas.at(3, 5), rgb(0, 0, 31));
+    CHECK_EQ(canvas.at(4, 5), rgb(5, 5, 5));
+}
+
 void test_pixel_processor() {
     const u32 normal_avg = (u32{kPpmpAverage} << 16) | kPpmpNormal;
     const u16 frame = rgb(10, 20, 30);
@@ -244,9 +286,11 @@ int main() {
     test_rotated_cel_has_no_gaps_or_overlaps();
     test_warp_widens_rows();
     test_face_culling();
+    test_half_pixel_position();
     test_coded_4bpp_with_pluta();
     test_pixel_processor();
     test_packed_cel();
+    test_lrform_cel();
     test_vram_line_pair_layout();
     return report("cel_test");
 }

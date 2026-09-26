@@ -10,6 +10,10 @@
 namespace core::xbus {
 class Xbus;
 }
+namespace core::dsp {
+class Dspp;
+class AudioDma;
+}
 
 namespace core::clio {
 
@@ -42,6 +46,19 @@ public:
     static constexpr u32 kRegTimerCtlHiSet = 0x208;  // timers 8-15
     static constexpr u32 kRegTimerCtlHiClr = 0x20C;
     static constexpr u32 kRegTimerSlack = 0x220;
+    static constexpr u32 kRegExpCtl = 0x400;       // expansion bus control (xb_SetExpCtl)
+    static constexpr u32 kExpCtlDmaOn = 0x800;     // XB_DMAON
+    static constexpr u32 kExpCtlCpuHasBus = 0x80;  // XB_CPUHASXBUS: set again when a DMA ends
+    static constexpr u32 kRegXbusDipir2 = 0x414;   // xb_DIPIR2
+    // Opera returns XB_DipirNOSR ("dipir occurred before soft reset") here,
+    // noting the CD-ROM dipir requires it.
+    static constexpr u32 kDipir2Value = 0x4000;
+    static constexpr u32 kRegFifoInit = 0x300;
+    static constexpr u32 kRegDmaEnableSet = 0x304;
+    static constexpr u32 kRegDmaEnableClr = 0x308;
+    static constexpr u32 kDmaExpansionBus = 0x00100000;  // XBUS -> RAM (Opera)
+    static constexpr u32 kInt0ExpansionDmaDone = 1u << 29;  // INT0_DEXINT
+    static constexpr u32 kInt0Dsp = 1u << 11;               // INT0_DSPPINT
     static constexpr u32 kWindowBytes = 0x10000;
 
     static constexpr u32 kRevisionGreen = 0x02020000;  // CLIO_GREEN
@@ -77,6 +94,18 @@ public:
     // Routes +0x500..+0x5FF to the expansion bus.
     void attach_xbus(xbus::Xbus* xbus) { xbus_ = xbus; }
 
+    // Routes the DSP window (+0x17D0.. semaphore/control, +0x1800.. code,
+    // +0x3000.. input registers, +0x3800.. output registers) and the audio
+    // DMA enables.
+    void attach_dsp(dsp::Dspp* dsp, dsp::AudioDma* fifos) {
+        dsp_ = dsp;
+        fifos_ = fifos;
+    }
+
+    // Performs an expansion-bus DMA when software enables it (the transfer
+    // itself needs MADAM's DMA registers and RAM, so the system provides it).
+    void set_xbus_dma_handler(std::function<void()> handler) { xbus_dma_ = std::move(handler); }
+
     u32 mmio_read32(u32 offset) override;
     void mmio_write32(u32 offset, u32 value) override;
     [[nodiscard]] bool access_aborts(u32 offset) const override;
@@ -90,6 +119,12 @@ private:
 
     std::function<void(bool)> fiq_line_;
     xbus::Xbus* xbus_ = nullptr;
+    dsp::Dspp* dsp_ = nullptr;
+    dsp::AudioDma* fifos_ = nullptr;
+    [[nodiscard]] bool dsp_read(u32 offset, u32& value);
+    bool dsp_write(u32 offset, u32 value);
+    void update_dma_enable();
+    std::function<void()> xbus_dma_;
     std::vector<u32> regs_;
     void run_timer_scan();
 

@@ -13,6 +13,15 @@ endif()
 
 find_package(SDL2 REQUIRED CONFIG)
 
+# libchdr: reads MAME CHD disc images (bundles its LZMA/zlib/zstd/FLAC decoders).
+include(FetchContent)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(CHDR_WANT_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(libchdr
+    GIT_REPOSITORY https://github.com/rtissera/libchdr.git
+    GIT_TAG 8e7b8bd32bc676b7e5c6b42fe7d2daca986c4a0d)
+FetchContent_MakeAvailable(libchdr)
+
 # Shared warning flags, applied to every target we own.
 add_library(emu_warnings INTERFACE)
 if(MSVC)
@@ -28,6 +37,7 @@ add_library(emu_core STATIC
     src/core/bus/mmio_names.cpp
     src/core/cdrom/disc_image.cpp
     src/core/cdrom/opera_fs.cpp
+    src/core/cdrom/chd_image.cpp
     src/core/input/pbus.cpp
     src/core/cpu/arm60.cpp
     src/core/clio/clio.cpp
@@ -36,11 +46,13 @@ add_library(emu_core STATIC
     src/core/xbus/xbus.cpp
     src/core/slowbus/slow_bus.cpp
     src/core/video/vdlp.cpp
+    src/core/dsp/audio_dma.cpp
+    src/core/dsp/dspp.cpp
     src/core/madam/cel.cpp
     src/core/madam/madam.cpp
 )
 target_include_directories(emu_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(emu_core PRIVATE emu_warnings)
+target_link_libraries(emu_core PRIVATE emu_warnings chdr-static)
 
 # SDL2 frontend executable.
 add_executable(3do-emu

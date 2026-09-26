@@ -12,6 +12,9 @@
 namespace core::input {
 class PlayerBus;
 }
+namespace core::dsp {
+class AudioDma;
+}
 
 namespace core::madam {
 
@@ -41,6 +44,8 @@ public:
     static constexpr u32 kRegRegCtl3 = 0x13C;    // frame buffer write base
     static constexpr u32 kRegXyPosH = 0x140;
     static constexpr u32 kRegXyPosL = 0x144;
+    static constexpr u32 kRegXbusDmaDest = 0x540;  // expansion-bus DMA target (Opera)
+    static constexpr u32 kRegXbusDmaLen = 0x544;   // bytes - 4; idle = 0xFFFFFFFC
     static constexpr u32 kRegPlayerDest = 0x570;  // RAMtofrPLAYER[0]: input buffer
     static constexpr u32 kRegPlayerLen = 0x574;   // RAMtofrPLAYER[1]: bytes after the first word
     static constexpr u32 kRegPlayerOut = 0x578;   // RAMtofrPLAYER[2]: output buffer (advanced, unused)
@@ -75,6 +80,9 @@ public:
     u32 mmio_read32(u32 offset) override;
     void mmio_write32(u32 offset, u32 value) override;
 
+    // +0x400..+0x53F are the audio DMA FIFO registers.
+    void attach_audio_dma(dsp::AudioDma* fifos) { fifos_ = fifos; }
+
     [[nodiscard]] u32 mctl() const { return regs_[kRegMctl >> 2]; }
     [[nodiscard]] u32 vdl_head() const { return regs_[kRegVdlHead >> 2]; }
     [[nodiscard]] u64 cels_drawn() const { return cels_drawn_; }
@@ -95,6 +103,7 @@ private:
 
     // Cel engine state that persists from one CCB to the next.
     std::span<u8> ram_;
+    dsp::AudioDma* fifos_ = nullptr;
     s32 x_pos_ = 0;
     s32 y_pos_ = 0;
     s32 hdx_ = 0, hdy_ = 0, vdx_ = 0, vdy_ = 0, hddx_ = 0, hddy_ = 0;

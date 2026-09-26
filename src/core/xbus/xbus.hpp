@@ -34,8 +34,13 @@ public:
     u32 read(u32 offset);
     void write(u32 offset, u32 value);
 
-    // Called periodically: re-raises the interrupt while a device needs service.
-    void tick();
+    // Called periodically with the emulated time elapsed: advances the drive
+    // and re-raises the interrupt while a device needs service.
+    void tick(u32 cpu_cycles);
+
+    // One byte from the selected device's data FIFO (also used by CLIO's
+    // expansion-bus DMA).
+    u8 read_data();
 
     [[nodiscard]] CdDrive& cd_drive() { return cd_drive_; }
 

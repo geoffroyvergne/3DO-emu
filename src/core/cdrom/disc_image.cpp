@@ -1,6 +1,7 @@
 #include "core/cdrom/disc_image.hpp"
 
 #include <algorithm>
+#include <fstream>
 
 #include "common/log.hpp"
 
@@ -11,6 +12,7 @@ namespace {
 constexpr u32 kRawSectorSize = 2352;
 constexpr std::array<u8, 12> kSyncPattern = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
                                              0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+constexpr std::array<u8, 8> kChdMagic = {'M', 'C', 'o', 'm', 'p', 'r', 'H', 'D'};
 
 struct Layout {
     u32 stride;
@@ -19,12 +21,33 @@ struct Layout {
 
 constexpr Layout layout_of(DiscImage::Format format) {
     switch (format) {
-        case DiscImage::Format::Cooked2048: return {kSectorSize, 0};
         case DiscImage::Format::Raw2352Mode1: return {kRawSectorSize, 16};
         case DiscImage::Format::Raw2352Mode2Form1: return {kRawSectorSize, 24};
+        default: return {kSectorSize, 0};
     }
-    return {kSectorSize, 0};
 }
+
+// Uncompressed image: a plain file of 2048- or 2352-byte sectors.
+class FileDiscImage final : public DiscImage {
+public:
+    FileDiscImage(std::ifstream file, Format format, u32 sector_count)
+        : file_(std::move(file)),
+          format_(format),
+          stride_(layout_of(format).stride),
+          data_offset_(layout_of(format).data_offset),
+          sector_count_(sector_count) {}
+
+    bool read_sector(u32 lba, std::span<u8, kSectorSize> out) override;
+    [[nodiscard]] u32 sector_count() const override { return sector_count_; }
+    [[nodiscard]] Format format() const override { return format_; }
+
+private:
+    std::ifstream file_;
+    Format format_;
+    u32 stride_;
+    u32 data_offset_;
+    u32 sector_count_;
+};
 
 }  // namespace
 
@@ -41,6 +64,7 @@ std::unique_ptr<DiscImage> DiscImage::open(const std::filesystem::path& path) {
         Log::error("Disc image '{}' is too small", path.string());
         return nullptr;
     }
+    if (std::ranges::equal(std::span(head).first<8>(), kChdMagic)) return open_chd_image(path);
 
     // Raw sectors start with the CD sync pattern; byte 15 is the sector mode.
     Format format = Format::Cooked2048;
@@ -61,18 +85,11 @@ std::unique_ptr<DiscImage> DiscImage::open(const std::filesystem::path& path) {
                   path.string(), file_size, layout.stride);
 
     file.clear();
-    return std::unique_ptr<DiscImage>(
-        new DiscImage(std::move(file), format, static_cast<u32>(file_size / layout.stride)));
+    return std::make_unique<FileDiscImage>(std::move(file), format,
+                                           static_cast<u32>(file_size / layout.stride));
 }
 
-DiscImage::DiscImage(std::ifstream file, Format format, u32 sector_count)
-    : file_(std::move(file)),
-      format_(format),
-      stride_(layout_of(format).stride),
-      data_offset_(layout_of(format).data_offset),
-      sector_count_(sector_count) {}
-
-bool DiscImage::read_sector(u32 lba, std::span<u8, kSectorSize> out) {
+bool FileDiscImage::read_sector(u32 lba, std::span<u8, kSectorSize> out) {
     if (lba >= sector_count_) {
         Log::warn("Disc read past end: sector {} of {}", lba, sector_count_);
         return false;
@@ -93,6 +110,7 @@ std::string_view DiscImage::format_name(Format format) {
         case Format::Cooked2048: return "ISO (2048 bytes/sector)";
         case Format::Raw2352Mode1: return "raw BIN (2352 bytes/sector, Mode 1)";
         case Format::Raw2352Mode2Form1: return "raw BIN (2352 bytes/sector, Mode 2 Form 1)";
+        case Format::Chd: return "CHD (compressed)";
     }
     return "unknown";
 }

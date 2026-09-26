@@ -11,6 +11,9 @@
 #include "core/video/vdlp.hpp"
 #include "common/endian.hpp"
 #include "core/xbus/xbus.hpp"
+#include "core/cdrom/disc_image.hpp"
+#include "core/dsp/audio_dma.hpp"
+#include "core/dsp/dspp.hpp"
 #include "test_common.hpp"
 
 namespace {
@@ -114,17 +117,144 @@ void test_xbus_cd_drive() {
     for (u32 b : {0x83u, 0u, 0u, 0u, 0u, 0u, 0u}) xbus.write(Xbus::kFifoCommandStatus, b);  // READ ID
     CHECK_EQ(xbus.read(Xbus::kPoll) & 0x10, 0x10u);      // status valid
     CHECK_EQ(interrupts > 0, true);
-    const u8 expected[] = {0x83, 0x00, 0x10, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0x81};
+    const u8 expected[] = {0x83, 0x00, 0x10, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0x83};  // ready, door, 2x
     for (u8 e : expected) CHECK_EQ(xbus.read(Xbus::kFifoCommandStatus), e);
     CHECK_EQ(xbus.read(Xbus::kPoll) & 0x10, 0u);         // drained
 
     for (u32 b : {0x8Cu, 0u, 0u, 0u, 0u, 0u, 0u}) xbus.write(Xbus::kFifoCommandStatus, b);  // READ TOC
     CHECK_EQ(xbus.read(Xbus::kFifoCommandStatus), 0x8Cu);
-    CHECK_EQ(xbus.read(Xbus::kFifoCommandStatus), 0x90u);  // door closed + error, no disc
+    CHECK_EQ(xbus.read(Xbus::kFifoCommandStatus), 0x92u);  // door closed + error + 2x, no disc
 
     xbus.write(Xbus::kSelect, 3);                        // nothing in slot 3
     CHECK_EQ(xbus.access_aborts(Xbus::kPoll), true);
     CHECK_EQ(xbus.access_aborts(Xbus::kSelect), false);  // select register never aborts
+}
+
+// A disc whose sector n is filled with byte n.
+class FakeDisc final : public core::cdrom::DiscImage {
+public:
+    bool read_sector(u32 lba, std::span<u8, core::cdrom::kSectorSize> out) override {
+        std::fill(out.begin(), out.end(), static_cast<u8>(lba));
+        return true;
+    }
+    [[nodiscard]] u32 sector_count() const override { return 1000; }
+    [[nodiscard]] Format format() const override { return Format::Cooked2048; }
+};
+
+void test_cd_drive_with_disc() {
+    using core::xbus::CdDrive;
+    CdDrive drive;
+    drive.insert_disc(std::make_unique<FakeDisc>());
+    auto command = [&](std::initializer_list<u8> bytes) {
+        for (u8 b : bytes) drive.write_command(b);
+    };
+    auto status = [&](std::size_t n) {
+        std::vector<u8> out;
+        for (std::size_t i = 0; i < n; ++i) out.push_back(drive.read_status());
+        return out;
+    };
+
+    command({0x8B, 0, 0, 0, 0, 0, 0});  // READ DISC INFO: 1000 sectors -> lead-out 00:15:25
+    const auto info = status(8);
+    CHECK_EQ(info[1], 0u);              // disc type CD-ROM
+    CHECK_EQ(info[2], 1u);              // tracks 1..1
+    CHECK_EQ(info[3], 1u);
+    CHECK_EQ(info[4], 0u);
+    CHECK_EQ(info[5], 15u);
+    CHECK_EQ(info[6], 25u);
+    CHECK_EQ(info[7], 0xE3u);           // ready, door, disc, spinning, 2x
+
+    command({0x8C, 0, 1, 0, 0, 0, 0});  // READ TOC track 1: data track at 00:02:00
+    const auto toc = status(10);
+    CHECK_EQ(toc[2], 0x14u);
+    CHECK_EQ(toc[6], 2u);
+
+    command({0x10, 0, 2, 5, 0, 0, 2});  // READ DATA 00:02:05 (LBA 5), 2 blocks
+    CHECK_EQ(drive.poll() & 0x30, 0u);  // nothing until the drive has read a sector
+    drive.advance(CdDrive::kCpuClockHz / 150);
+    CHECK_EQ(drive.poll() & 0x30, 0x30u);  // status + data valid together
+    const auto read_status = status(2);
+    CHECK_EQ(read_status[0], 0x10u);
+    CHECK_EQ(drive.data_available(), 2048u);
+    u32 sum = 0;
+    for (int i = 0; i < 2048; ++i) sum += drive.read_data();
+    CHECK_EQ(sum, 5u * 2048);
+    CHECK_EQ(drive.poll() & 0x20, 0u);
+    drive.advance(CdDrive::kCpuClockHz / 150);
+    CHECK_EQ(drive.read_data(), 6u);    // second sector
+
+    command({0x06, 0, 0, 0, 0, 0, 0});  // eject
+    status(2);
+    command({0x8B, 0, 0, 0, 0, 0, 0});
+    CHECK_EQ(status(2)[1] & 0x10, 0x10u);  // error: disc out
+}
+
+void test_dsp_semaphore_program() {
+    std::vector<u8> ram(0x1000);
+    core::dsp::AudioDma fifos(ram, nullptr);
+    core::dsp::Dspp dsp(fifos);
+
+    // Idle DSP: code memory is all `sleep`, output silent.
+    CHECK_EQ(dsp.run_sample(), 0u);
+
+    // ARM writes the semaphore: status 8 ("ARM last").
+    dsp.write_semaphore(0xBEEF);
+    CHECK_EQ(dsp.read_semaphore(), 0x0008BEEFu);
+
+    // MOVE #0x123 -> 0x3ED (semaphore data), MOVE #0x0456 -> 0x3FE (left DAC), sleep.
+    const u16 program[] = {0x9BED, 0xC123, 0x9BFE, 0xC456, 0x8380};
+    for (u32 i = 0; i < std::size(program); ++i) dsp.write_code(i, program[i]);
+    dsp.set_running(true);
+    const u32 out = dsp.run_sample();
+    CHECK_EQ(dsp.read_semaphore(), 0x00040123u);  // status 4: DSP wrote last
+    CHECK_EQ(out & 0xFFFF, 0x0456u);
+}
+
+void test_dsp_input_fifo() {
+    std::vector<u8> ram(0x1000);
+    u32 interrupts = 0;
+    core::dsp::AudioDma fifos(ram, [&](u32 bits) { interrupts |= bits; });
+    ram[0x100] = 0x12; ram[0x101] = 0x34; ram[0x102] = 0x56; ram[0x103] = 0x78;
+    ram[0x200] = 0x9A; ram[0x201] = 0xBC;
+
+    fifos.write_register(0x400 + 0x20 + 0x0, 0x100);  // channel 2: 8 bytes at 0x100
+    fifos.write_register(0x400 + 0x20 + 0x4, 4);      // length written as bytes - 4
+    fifos.write_register(0x400 + 0x20 + 0x8, 0x200);  // then 8 bytes at 0x200
+    fifos.write_register(0x400 + 0x20 + 0xC, 4);
+    fifos.set_dma_enable(1u << 2);
+
+    CHECK_EQ(fifos.input_status(2), 2u);
+    CHECK_EQ(fifos.pop_input(2), 0x1234u);
+    CHECK_EQ(fifos.pop_input(2), 0x5678u);
+    fifos.pop_input(2);
+    fifos.pop_input(2);
+    CHECK_EQ(interrupts, 0u);
+    CHECK_EQ(fifos.pop_input(2), 0x9ABCu);          // drained: interrupt, reload
+    CHECK_EQ(interrupts, 1u << (16 + 2));
+    CHECK_EQ(fifos.read_register(0x420), 0x202u);   // current address advanced
+}
+
+void test_cd_tray_change() {
+    using core::xbus::CdDrive;
+    CdDrive drive;
+    drive.insert_disc(std::make_unique<FakeDisc>());
+    auto command = [&](std::initializer_list<u8> bytes) { for (u8 b : bytes) drive.write_command(b); };
+
+    drive.open_tray();
+    CHECK_EQ(drive.tray_open(), true);
+    CHECK_EQ(drive.poll() & 0x80, 0x80u);          // media-changed latch
+    command({0x8B, 0, 0, 0, 0, 0, 0});
+    CHECK_EQ(drive.read_status(), 0x8Bu);
+    CHECK_EQ(drive.read_status() & 0xC0, 0u);      // door open, no disc
+
+    drive.write_poll(0x80);                        // software acknowledges the latch
+    CHECK_EQ(drive.poll() & 0x80, 0u);
+    drive.close_tray(std::make_unique<FakeDisc>());
+    CHECK_EQ(drive.tray_open(), false);
+    CHECK_EQ(drive.poll() & 0x80, 0x80u);
+    command({0x8B, 0, 0, 0, 0, 0, 0});             // the new disc answers
+    CHECK_EQ(drive.read_status(), 0x8Bu);
+    CHECK_EQ(drive.read_status(), 0u);             // disc type CD-ROM
 }
 
 void test_nvram() {
@@ -219,5 +349,9 @@ int main() {
     test_madam_cel_list();
     test_vdlp_scanout();
     test_nvram();
+    test_cd_drive_with_disc();
+    test_cd_tray_change();
+    test_dsp_semaphore_program();
+    test_dsp_input_fifo();
     return report("devices_test");
 }
